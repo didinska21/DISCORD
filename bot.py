@@ -63,14 +63,15 @@ BTN_STOP_ALL  = "⏸ Stop All"
 
 BTN_COUNT_ON  = "⏳ Countdown ON"
 BTN_COUNT_OFF = "🕒 Countdown OFF"
+BTN_PIN       = "📌 Pin Countdown"
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    # 2 kolom seperti contoh screenshot
     return ReplyKeyboardMarkup(
         [
             [BTN_FOTO, BTN_LINK],
             [BTN_SET_INTERVAL, BTN_COUNT_ON],
             [BTN_START_ALL, BTN_STOP_ALL],
+            [BTN_PIN],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -78,12 +79,11 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 def back_with_controls_keyboard() -> ReplyKeyboardMarkup:
-    # submenu Foto/Link: ada Start/Stop + Countdown + Back
     return ReplyKeyboardMarkup(
         [
             [BTN_START, BTN_STOP],
             [BTN_COUNT_ON, BTN_COUNT_OFF],
-            [BTN_BACK],
+            [BTN_BACK, BTN_PIN],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -213,51 +213,119 @@ async def discord_send_message(content: str, channel_id: str | None = None) -> N
 
 
 # =============== Processor ===============
-async def process_one() -> bool:
+async def _send_photo_item(item):
+    p = Path(item["path"])
+    data = p.read_bytes()
+    await discord_send_image(data, p.name, channel_id=item.get("to"))
+    try: p.unlink(missing_ok=True)
+    except Exception: pass
+
+async def _send_link_item(item):
+    url_text = item["url"]
+    target_channel = item.get("to") or DISCORD_CHANNEL_ID_LINK
+    await discord_send_message(url_text, channel_id=target_channel)
+
+def _pop_first_indices(q):
+    """return tuple (photo_idx, link_idx) or (None,None) if not found."""
+    photo_idx = None
+    link_idx = None
+    for i, it in enumerate(q):
+        if photo_idx is None and ("path" in it and it.get("type") != "link"):
+            photo_idx = i
+        if link_idx is None and it.get("type") == "link":
+            link_idx = i
+        if photo_idx is not None and link_idx is not None:
+            break
+    return photo_idx, link_idx
+
+async def process_tick() -> int:
+    """
+    Kirim maksimal 1 foto + 1 link pada setiap tick.
+    Return: jumlah item terkirim (0..2).
+    """
     q = load_queue()
     if not q:
-        return False
-    item = q.pop(0)   # {path, ts, from}  |  {"type":"link","url":..., "ts":..., "to":...}
+        return 0
+
+    photo_idx, link_idx = _pop_first_indices(q)
+    items = []
+
+    # pop dengan aman (index lebih besar dulu)
+    take_indices = [i for i in [photo_idx, link_idx] if i is not None]
+    if not take_indices:
+        return 0
+    for idx in sorted(take_indices, reverse=True):
+        items.append(q.pop(idx))
+
+    save_queue(q)
+
+    # kirim paralel
+    tasks = []
+    for it in items:
+        if "path" in it and it.get("type") != "link":
+            tasks.append(_send_photo_item(it))
+        elif it.get("type") == "link":
+            tasks.append(_send_link_item(it))
+
+    sent = 0
     try:
-        # FOTO (format lama)
-        if "path" in item and item.get("type") != "link":
-            p = Path(item["path"])
-            data = p.read_bytes()
-            await discord_send_image(data, p.name, channel_id=item.get("to"))
-            try: p.unlink(missing_ok=True)
-            except Exception: pass
-            save_queue(q)
-            print(f"[✔] (foto) Terkirim ke Discord: {p.name}")
-            return True
-
-        # LINK (format baru)
-        if item.get("type") == "link":
-            url_text = item["url"]
-            target_channel = item.get("to") or DISCORD_CHANNEL_ID_LINK
-            await discord_send_message(url_text, channel_id=target_channel)
-            save_queue(q)
-            print(f"[✔] (link) Terkirim ke Discord: {url_text}")
-            return True
-
-        raise RuntimeError(f"Unknown queue item format: {item}")
-
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                # gagal → kembalikan ke depan queue
+                q = load_queue()
+                # masukkan kembali item terkait (cari dari items)
+                for it in items:
+                    # hanya kembalikan sekali
+                    if it not in q:
+                        q.insert(0, it)
+                        break
+                save_queue(q)
+            else:
+                sent += 1
     except Exception as e:
-        print("[!] Gagal kirim:", e)
-        q.insert(0, item); save_queue(q)
-        return False
+        # fallback: kembalikan semua
+        q = load_queue()
+        for it in items:
+            q.insert(0, it)
+        save_queue(q)
+        return 0
+
+    return sent
 
 async def process_all_once() -> int:
-    sent = 0
-    while await process_one():
-        sent += 1
-    return sent
+    sent_total = 0
+    while True:
+        sent = await process_tick()
+        if sent == 0:
+            break
+        sent_total += sent
+    return sent_total
 
 
 # =============== Scheduler (manual start/stop + dynamic interval) ===============
+async def _notify_finished_and_stop(app: Application):
+    # edit semua countdown jadi final, lalu hentikan scheduler & watcher
+    final_text = "✅ Sudah terkirim semua file foto/link dalam antrian.\nQueue kosong. Scheduler berhenti."
+    for chat_id, msg_id in list(STATE.watchers.items()):
+        try:
+            await app.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=final_text)
+        except Exception:
+            pass
+    STATE.watchers.clear()
+    # stop scheduler flags
+    STATE.running = False
+    if STATE.scheduler_task:
+        STATE.scheduler_task.cancel()
+    STATE.scheduler_task = None
+    STATE.next_send_at = None
+    print("[ℹ] Semua item terkirim. Scheduler dihentikan.")
+
 async def scheduler_loop():
     print("[▶] Scheduler STARTED")
-    # kirim sekali saat start (konfirmasi kalau ada)
-    await process_one()
+    # kirim sekali saat start (maks 1 foto + 1 link)
+    await process_tick()
+    # set next
     STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
 
     try:
@@ -269,15 +337,28 @@ async def scheduler_loop():
             await asyncio.sleep(sleep_ms / 1000.0)
             if not STATE.running:
                 break
-            await process_one()
+
+            sent = await process_tick()
+
+            # kalau setelah tick queue kosong → stop & beri notifikasi
+            if not load_queue():
+                await _notify_finished_and_stop(app=context_application)  # will be set in start_scheduler
+                break
+
+            # kalau tidak ada yang terkirim sama sekali (misal semua error), tetap lanjut
             STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     finally:
         print("[⏸] Scheduler STOPPED")
 
+# we need to capture application for notify function
+context_application: Application | None = None
+
 def start_scheduler(app: Application) -> bool:
+    global context_application
     if STATE.running:
         return False
     STATE.running = True
+    context_application = app
     STATE.scheduler_task = app.create_task(scheduler_loop())
     return True
 
@@ -312,8 +393,14 @@ def build_watch_text() -> str:
     bar = progress_bar(eta_ms, total, 24)
     STATE.spinner_idx = (STATE.spinner_idx + 1) % len(STATE.spinner_frames)
     spin = STATE.spinner_frames[STATE.spinner_idx]
-    next_name = Path(q[0]["path"]).name if (q and "path" in q[0] and q[0].get("type") != "link") else ("(link)" if q else "(tidak ada item)")
-    # Plain text
+    # tampilkan next item hint
+    next_name = "(tidak ada item)"
+    if q:
+        first_photo = next((it for it in q if "path" in it and it.get("type") != "link"), None)
+        if first_photo:
+            next_name = Path(first_photo["path"]).name
+        else:
+            next_name = "(link)"
     return (
         f"{spin} Bot Status\n"
         f"State: {'Running' if running else 'Paused'}\n"
@@ -343,10 +430,25 @@ async def watch_loop(app: Application):
 # helper: nyalakan countdown otomatis utk chat tertentu
 async def ensure_countdown_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # jika belum ada message countdown, kirim baru
     if chat_id not in STATE.watchers:
         sent = await context.bot.send_message(chat_id=chat_id, text=build_watch_text())
         STATE.watchers[chat_id] = sent.message_id
+
+async def pin_countdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Coba pin pesan countdown di chat ini (kalau ada)."""
+    chat_id = update.effective_chat.id
+    msg_id = STATE.watchers.get(chat_id)
+    if not msg_id:
+        # buat dulu kalau belum ada
+        sent = await context.bot.send_message(chat_id=chat_id, text=build_watch_text())
+        msg_id = sent.message_id
+        STATE.watchers[chat_id] = msg_id
+    try:
+        # PTB v20: pinChatMessage -> pin_chat_message
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg_id)
+        await context.bot.send_message(chat_id=chat_id, text="📌 Countdown dipin.")
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Tidak bisa pin (mungkin bukan grup/supergroup atau kurang izin).")
 
 
 # =============== Telegram Handlers ===============
@@ -384,7 +486,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("[photo] error:", e)
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Gagal memproses foto.")
 
-# === MENU & TEKS (Link, Set Interval, Start/Stop, Countdown) ===
+# === MENU & TEKS (Link, Set Interval, Start/Stop, Countdown, Pin) ===
 async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -411,12 +513,17 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
+    # PIN
+    if text == BTN_PIN:
+        await pin_countdown(update, context)
+        return
+
     # Menu utama
     if mode == "" and text == BTN_FOTO:
         STATE.modes[chat_id] = "photo"
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Mode 📷 Kirim Foto.\nKirim foto ke chat ini.\nTersedia: ▶️ Start, ⏸ Stop, ⏳ Countdown ON/OFF, ⬅️ Kembali.",
+            text="Mode 📷 Kirim Foto.\nKirim foto ke chat ini.\nTersedia: ▶️ Start, ⏸ Stop, ⏳ Countdown ON/OFF, 📌 Pin, ⬅️ Kembali.",
             reply_markup=back_with_controls_keyboard()
         ); return
 
@@ -424,7 +531,7 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.modes[chat_id] = "link"
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Mode 🔗 Kirim Link.\nKirim satu/lebih URL dalam satu pesan.\nTersedia: ▶️ Start, ⏸ Stop, ⏳ Countdown ON/OFF, ⬅️ Kembali.",
+            text="Mode 🔗 Kirim Link.\nKirim satu/lebih URL dalam satu pesan.\nTersedia: ▶️ Start, ⏸ Stop, ⏳ Countdown ON/OFF, 📌 Pin, ⬅️ Kembali.",
             reply_markup=back_with_controls_keyboard()
         ); return
 
@@ -511,11 +618,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = load_queue()
     running = STATE.running
     eta_ms = int((STATE.next_send_at - datetime.now(timezone.utc)).total_seconds() * 1000) if (running and STATE.next_send_at) else None
-    next_name = (
-    Path(q[0]["path"]).name
-    if (q and "path" in q[0] and q[0].get("type") != "link")
-    else ("(link)" if q else "(tidak ada item)")
-)
+    # tampilkan hint next item
+    next_name = "(tidak ada)"
+    if q:
+        first_photo = next((it for it in q if "path" in it and it.get("type") != "link"), None)
+        next_name = Path(first_photo["path"]).name if first_photo else "(link)"
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
@@ -543,15 +650,19 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p = Path(item["path"])
                 if p.exists():
                     await context.bot.send_photo(chat_id=update.effective_chat.id, photo=p.read_bytes())
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
         except Exception as e:
             print("[/list] gagal preview item:", e)
 
 async def cmd_sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
     count = await process_all_once()
-    if STATE.running:
-        STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+    if not load_queue():
+        # habis → stop & notif
+        await _notify_finished_and_stop(context.application)
+    else:
+        if STATE.running:
+            STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     await context.bot.send_message(chat_id=update.effective_chat.id,
                                    text=f"{'Terkirim ' + str(count) + ' item.' if count>0 else 'Tidak ada item di antrian.'}")
 
@@ -559,10 +670,10 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
     q = load_queue()
     for it in q:
-        try: 
+        try:
             if "path" in it:
                 Path(it["path"]).unlink(missing_ok=True)
-        except Exception: 
+        except Exception:
             pass
     save_queue([])
     await context.bot.send_message(chat_id=update.effective_chat.id, text="Antrian dikosongkan.")
@@ -652,7 +763,8 @@ def main():
     app = build_app()
 
     print("[ℹ] Bot siap. Gunakan /start untuk menampilkan menu.")
-    print("[ℹ] Menu: Kirim Foto / Kirim Link / Set Interval / Start All / Stop All + Countdown.")
+    print("[ℹ] Menu: Kirim Foto / Kirim Link / Set Interval / Start All / Stop All + Countdown & Pin.")
+    print("[ℹ] Tiap tick mengirim maks 1 foto + 1 link paralel.")
 
     # Python 3.12: pastikan ada event loop sebelum run_polling
     loop = asyncio.new_event_loop()
