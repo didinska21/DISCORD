@@ -511,7 +511,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = load_queue()
     running = STATE.running
     eta_ms = int((STATE.next_send_at - datetime.now(timezone.utc)).total_seconds() * 1000) if (running and STATE.next_send_at) else None
-    next_name = Path(q[0]["path"]).name if (q and "path" in q[0] and q[0].get("type") != "link") else ("(link)" if q else "(tidak ada)")
+    next_name = (
+    Path(q[0]["path"]).name
+    if (q and "path" in q[0] and q[0].get("type") != "link")
+    else ("(link)" if q else "(tidak ada item)")
+)
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
