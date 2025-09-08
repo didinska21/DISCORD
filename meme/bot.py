@@ -49,10 +49,10 @@ class State:
         self.interval_ms = int(SEND_INTERVAL_HOURS * 3600 * 1000)
         self.running = False
         self.scheduler_task: asyncio.Task | None = None
-        self.next_send_at = None
+        self.next_send_at: datetime | None = None
         self.watchers: dict[int, int] = {}
-        self.spinner = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
-        self.si = 0
+        self.spinner = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']; self.si=0
+        self.grace_until: datetime | None = None  # nunggu 1 interval setelah queue kosong
 
 STATE = State()
 context_app: Application | None = None
@@ -67,8 +67,7 @@ def is_admin(update: Update) -> bool:
         return False
 
 async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if is_admin(update):
-        return True
+    if is_admin(update): return True
     await context.bot.send_message(chat_id=update.effective_chat.id, text="⛔ Tidak ada akses.")
     return False
 
@@ -119,23 +118,28 @@ async def discord_send_image(buf: bytes, filename: str):
 # ========== PROCESSOR ==========
 async def _send_photo_item(item):
     p = Path(item["path"])
-    await discord_send_image(p.read_bytes(), p.name)
+    data = p.read_bytes()
+    await discord_send_image(data, p.name)
     try: p.unlink(missing_ok=True)
     except: pass
 
+# PEEK-THEN-POP: anti hilang
 async def process_tick() -> int:
     q = load_queue()
-    if not q: return 0
+    if not q:
+        return 0
     idx = next((i for i,it in enumerate(q) if "path" in it), None)
-    if idx is None: return 0
-    item = q.pop(idx); save_queue(q)
+    if idx is None:
+        return 0
+    item = q[idx]  # PEEK (jangan pop dulu)
     try:
-        await _send_photo_item(item)
+        await _send_photo_item(item)         # kirim
+        q.pop(idx); save_queue(q)            # sukses → pop & simpan
         logger.info("Sent 1 photo. Queue left=%d", len(q))
         return 1
     except Exception as e:
         logger.exception("Send photo failed: %s", e)
-        q = load_queue(); q.insert(0, item); save_queue(q)
+        # gagal → queue biarkan utuh
         return 0
 
 async def process_all_once() -> int:
@@ -155,27 +159,48 @@ async def _notify_finished_and_stop(app: Application):
         except Exception: pass
     STATE.watchers.clear()
     STATE.running = False
-    if STATE.scheduler_task:
-        STATE.scheduler_task.cancel()
+    if STATE.scheduler_task: STATE.scheduler_task.cancel()
     STATE.scheduler_task = None
     STATE.next_send_at = None
+    STATE.grace_until = None
 
 async def scheduler_loop():
+    # kirim sekali saat start (opsional)
     await process_tick()
     STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     try:
         while STATE.running:
             now = datetime.now(timezone.utc)
+
+            # Fase grace: tunggu 1 interval setelah kosong
+            if STATE.grace_until is not None:
+                if load_queue():
+                    # ada item baru → batalkan grace
+                    STATE.grace_until = None
+                    STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
+                else:
+                    if now >= STATE.grace_until:
+                        await _notify_finished_and_stop(context_app); break
+                    STATE.next_send_at = STATE.grace_until
+
+            # Fallback: pastikan next_send_at tidak None sebelum tidur
             if STATE.next_send_at is None:
                 STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
+
             sleep_s = max(0.0, (STATE.next_send_at - now).total_seconds())
             await asyncio.sleep(sleep_s)
             if not STATE.running: break
-            sent = await process_tick()
+
+            _ = await process_tick()
+
             if not load_queue():
-                await _notify_finished_and_stop(context_app)
-                break
-            STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+                # mulai atau lanjut grace
+                if STATE.grace_until is None:
+                    STATE.grace_until = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+                STATE.next_send_at = STATE.grace_until
+            else:
+                STATE.grace_until = None
+                STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     finally:
         logger.info("Scheduler STOP")
 
@@ -193,12 +218,16 @@ def stop_scheduler() -> bool:
     if STATE.scheduler_task: STATE.scheduler_task.cancel()
     STATE.scheduler_task = None
     STATE.next_send_at = None
+    STATE.grace_until = None
     return True
 
 def set_interval_ms(ms: int):
     STATE.interval_ms = ms
+    now = datetime.now(timezone.utc)
     if STATE.running:
-        STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+        if STATE.grace_until is not None:
+            STATE.grace_until = now + timedelta(milliseconds=STATE.interval_ms)
+        STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
 
 # ========== UI ==========
 BTN_FOTO = "📷 Kirim Foto"
@@ -206,10 +235,11 @@ BTN_START = "▶️ Start"
 BTN_STOP  = "⏸ Stop"
 BTN_SET_INTERVAL = "⏱ Set Interval"
 BTN_LIST = "📦 Lihat Antrian"
+BTN_REFRESH = "🔄 Refresh"
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BTN_FOTO],[BTN_START, BTN_STOP],[BTN_SET_INTERVAL, BTN_LIST]],
+        [[BTN_FOTO],[BTN_START, BTN_STOP],[BTN_SET_INTERVAL, BTN_LIST],[BTN_REFRESH]],
         resize_keyboard=True, is_persistent=True
     )
 
@@ -218,13 +248,22 @@ def build_watch_text() -> str:
     q = load_queue()
     running = STATE.running
     total = STATE.interval_ms
-    eta_ms = int((STATE.next_send_at - datetime.now(timezone.utc)).total_seconds()*1000) if (running and STATE.next_send_at) else None
+
+    # Pastikan next_send_at selalu ada saat running/grace
+    if running and STATE.next_send_at is None:
+        STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=total)
+
+    eta_ms = None
+    if STATE.next_send_at is not None:
+        eta_ms = int((STATE.next_send_at - datetime.now(timezone.utc)).total_seconds()*1000)
+
     bar = progress_bar(eta_ms, total, 20)
     STATE.si = (STATE.si + 1) % len(STATE.spinner)
     spin = STATE.spinner[STATE.si]
     next_name = Path(q[0]["path"]).name if q else "(kosong)"
+    status_extra = " (grace)" if STATE.grace_until is not None else ""
     return (
-        f"{spin} Bot Meme Status\n"
+        f"{spin} Bot Meme Status{status_extra}\n"
         f"State: {'Running' if running else 'Paused'}\n"
         f"Queue: {len(q)}\n"
         f"Next: {fmt_hhmmss(eta_ms)}\n"
@@ -245,9 +284,17 @@ async def watch_loop(app: Application):
 
 async def ensure_countdown_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    text = build_watch_text()
     if chat_id not in STATE.watchers:
-        sent = await context.bot.send_message(chat_id=chat_id, text=build_watch_text())
+        sent = await context.bot.send_message(chat_id=chat_id, text=text)
         STATE.watchers[chat_id] = sent.message_id
+    else:
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=STATE.watchers[chat_id], text=text)
+        except Exception:
+            # kalau gagal edit (misal message dihapus), buat baru
+            sent = await context.bot.send_message(chat_id=chat_id, text=text)
+            STATE.watchers[chat_id] = sent.message_id
 
 # ========== HANDLERS ==========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,6 +314,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fpath = DATA_DIR / fname
     await tg_file.download_to_drive(str(fpath))
     q = load_queue(); q.append({"path": str(fpath), "ts": int(datetime.now().timestamp())}); save_queue(q)
+    # jika ada item baru saat grace → batalkan grace & reset hitung mundur
+    if STATE.grace_until is not None:
+        STATE.grace_until = None
+        if STATE.running:
+            STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     await context.bot.send_message(chat_id=update.effective_chat.id, text=f"✅ Foto ditambahkan. Antrian: {len(q)}")
 
 async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,6 +339,9 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             preview = "\n".join([f"{i+1}. {Path(it['path']).name}" for i,it in enumerate(q[:10])])
             more = f"\n...dan {len(q)-10} lagi" if len(q) > 10 else ""
             await context.bot.send_message(chat_id=update.effective_chat.id, text=f"📦 Daftar antrian ({len(q)} item):\n{preview}{more}")
+    elif txt == BTN_REFRESH:
+        await ensure_countdown_on(update, context)
+    # selain itu: abaikan (meme bot tidak parse URL)
 
 async def cmd_start_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
@@ -318,13 +373,20 @@ async def cmd_sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
     count = await process_all_once()
     if not load_queue():
-        await _notify_finished_and_stop(context.application)
+        # kosong → mulai grace, jangan langsung stop
+        if STATE.running:
+            STATE.grace_until = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+            STATE.next_send_at = STATE.grace_until
     elif STATE.running:
         STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Terkirim {count} item.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=build_watch_text())
+    await ensure_countdown_on(update, context)
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_countdown_on(update, context)
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🔄 Refreshed.")
 
 # ========== BOOT ==========
 async def delete_webhook():
@@ -344,14 +406,14 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("set_interval", cmd_set_interval))
     app.add_handler(CommandHandler("sendnow", cmd_sendnow))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_text))
     return app
 
 def main():
     asyncio.run(delete_webhook())
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     app = build_app()
     logger.info("=== Bot Meme BOOT ===")
     logger.info("Token OK, channel=%s, interval=%s ms", DISCORD_CHANNEL_ID, STATE.interval_ms)
