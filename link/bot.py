@@ -1,4 +1,4 @@
-import os, json, asyncio, aiohttp, re, logging
+import os, json, asyncio, aiohttp, re, logging, random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -15,11 +15,15 @@ logger = logging.getLogger("bot-link")
 
 # ========== ENV ==========
 load_dotenv()
-TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_ADMIN_ID     = os.getenv("TELEGRAM_ADMIN_ID", "")
-DISCORD_USER_TOKEN    = os.getenv("DISCORD_USER_TOKEN", "")
+TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ADMIN_ID       = os.getenv("TELEGRAM_ADMIN_ID", "")
+DISCORD_USER_TOKEN      = os.getenv("DISCORD_USER_TOKEN", "")
 DISCORD_CHANNEL_ID_LINK = os.getenv("DISCORD_CHANNEL_ID_LINK", "")
-SEND_INTERVAL_HOURS   = float(os.getenv("SEND_INTERVAL_HOURS", "6"))
+SEND_INTERVAL_HOURS     = float(os.getenv("SEND_INTERVAL_HOURS", "6"))
+
+# Jitter (menit) bisa diatur via ENV
+JITTER_MIN_MINUTES      = int(os.getenv("JITTER_MIN_MINUTES", "1"))
+JITTER_MAX_MINUTES      = int(os.getenv("JITTER_MAX_MINUTES", "30"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("[!] TELEGRAM_BOT_TOKEN belum di-set")
@@ -53,6 +57,10 @@ class State:
         self.watchers: dict[int, int] = {}
         self.spinner = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']; self.si = 0
         self.grace_until: datetime | None = None
+
+        # fase: 'jitter' | 'interval' | None
+        self.phase: str | None = None
+        self.jitter_until: datetime | None = None
 
 STATE = State()
 context_app: Application | None = None
@@ -89,6 +97,11 @@ def progress_bar(rem, total, width=20):
         return "▱" * width
     done = max(0, min(width, round(((total - rem) / total) * width)))
     return "▰" * done + "▱" * (width - done)
+
+def rand_jitter_ms() -> int:
+    lo = max(1, JITTER_MIN_MINUTES)
+    hi = max(lo, JITTER_MAX_MINUTES)
+    return random.randint(lo*60_000, hi*60_000)
 
 # ========== DISCORD ==========
 async def discord_send_message(content: str):
@@ -155,34 +168,75 @@ async def _notify_finished_and_stop(app: Application):
     STATE.scheduler_task = None
     STATE.next_send_at = None
     STATE.grace_until = None
+    STATE.phase = None
+    STATE.jitter_until = None
+
+def _enter_grace(now: datetime):
+    STATE.grace_until = now + timedelta(milliseconds=STATE.interval_ms)
+    STATE.next_send_at = STATE.grace_until
+    STATE.phase = None
+    STATE.jitter_until = None
+
+def _schedule_jitter(now: datetime):
+    jms = rand_jitter_ms()
+    STATE.jitter_until = now + timedelta(milliseconds=jms)
+    STATE.next_send_at = STATE.jitter_until
+    STATE.phase = 'jitter'
+
+def _schedule_interval(now: datetime):
+    STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
+    STATE.phase = 'interval'
+    STATE.jitter_until = None
 
 async def scheduler_loop():
-    await process_tick()
-    STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+    # Mulai dengan JITTER sebelum kirim pertama (kalau ada queue)
+    now = datetime.now(timezone.utc)
+    if load_queue():
+        _schedule_jitter(now)
+    else:
+        _enter_grace(now)
+
     try:
         while STATE.running:
             now = datetime.now(timezone.utc)
+
+            # Fase grace
             if STATE.grace_until is not None:
                 if load_queue():
                     STATE.grace_until = None
-                    STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
+                    _schedule_interval(now)  # konsisten: setelah ada item baru → delay utama dulu
                 else:
                     if now >= STATE.grace_until:
                         await _notify_finished_and_stop(context_app); break
                     STATE.next_send_at = STATE.grace_until
+
             if STATE.next_send_at is None:
-                STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
+                _schedule_jitter(now)
+
             sleep_s = max(0.0, (STATE.next_send_at - now).total_seconds())
             await asyncio.sleep(sleep_s)
             if not STATE.running: break
-            _ = await process_tick()
-            if not load_queue():
-                if STATE.grace_until is None:
-                    STATE.grace_until = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
-                STATE.next_send_at = STATE.grace_until
+
+            now = datetime.now(timezone.utc)
+
+            if STATE.phase == 'jitter':
+                if not load_queue():
+                    _enter_grace(now)
+                    continue
+
+                _ = await process_tick()
+
+                if not load_queue():
+                    _enter_grace(now)
+                else:
+                    _schedule_interval(now)
+
+            elif STATE.phase == 'interval':
+                _schedule_jitter(now)
+
             else:
-                STATE.grace_until = None
-                STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+                _schedule_jitter(now)
+
     finally:
         logger.info("Scheduler STOP")
 
@@ -201,6 +255,8 @@ def stop_scheduler() -> bool:
     STATE.scheduler_task = None
     STATE.next_send_at = None
     STATE.grace_until = None
+    STATE.phase = None
+    STATE.jitter_until = None
     return True
 
 def set_interval_ms(ms: int):
@@ -209,7 +265,10 @@ def set_interval_ms(ms: int):
     if STATE.running:
         if STATE.grace_until is not None:
             STATE.grace_until = now + timedelta(milliseconds=STATE.interval_ms)
-        STATE.next_send_at = now + timedelta(milliseconds=STATE.interval_ms)
+            STATE.next_send_at = STATE.grace_until
+        else:
+            if STATE.phase == 'interval':
+                _schedule_interval(now)
 
 # ========== UI ==========
 BTN_LINK = "🔗 Kirim Link"
@@ -230,16 +289,34 @@ def build_watch_text() -> str:
     q = load_queue()
     running = STATE.running
     total = STATE.interval_ms
+
     if running and STATE.next_send_at is None:
         STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=total)
+
     eta_ms = None
     if STATE.next_send_at is not None:
         eta_ms = int((STATE.next_send_at - datetime.now(timezone.utc)).total_seconds()*1000)
-    bar = progress_bar(eta_ms, total, 20)
+
+    # total untuk progress bar
+    if STATE.grace_until is not None:
+        pb_total = int((STATE.grace_until - datetime.now(timezone.utc)).total_seconds()*1000) + 1
+    elif STATE.phase == 'jitter' and STATE.jitter_until is not None:
+        pb_total = int((STATE.jitter_until - datetime.now(timezone.utc)).total_seconds()*1000) + 1
+    else:
+        pb_total = total
+
+    bar = progress_bar(eta_ms, pb_total, 20)
     STATE.si = (STATE.si + 1) % len(STATE.spinner)
     spin = STATE.spinner[STATE.si]
     next_item = q[0]["url"] if q else "(kosong)"
-    status_extra = " (grace)" if STATE.grace_until is not None else ""
+
+    if STATE.grace_until is not None:
+        status_extra = " (grace)"
+    elif STATE.phase == 'jitter':
+        status_extra = " (jitter)"
+    else:
+        status_extra = ""
+
     return (
         f"{spin} Bot Link Status{status_extra}\n"
         f"State: {'Running' if running else 'Paused'}\n"
@@ -293,18 +370,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if u.lower().startswith("www."): u = "https://" + u
         q.append({"type": "link", "url": u, "ts": int(datetime.now().timestamp())})
     save_queue(q)
+
+    # Jika ada link baru saat grace → batalkan grace, dan kalau running mulai dari delay utama
     if STATE.grace_until is not None:
         STATE.grace_until = None
         if STATE.running:
+            # konsisten dengan meme bot: masuk fase interval dulu
+            STATE.phase = 'interval'
             STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
+
     await context.bot.send_message(chat_id=update.effective_chat.id, text=f"✅ {len(urls)} link ditambahkan. Antrian: {len(q)}")
 
 async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if txt == BTN_LINK:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Mode kirim link aktif. Kirim URL ke chat ini.")
-    elif txt == BTN_START: await cmd_start_send(update, context)
-    elif txt == BTN_STOP: await cmd_stop_send(update, context)
+    elif txt == BTN_START:
+        await cmd_start_send(update, context)
+    elif txt == BTN_STOP:
+        await cmd_stop_send(update, context)
     elif txt == BTN_SET_INTERVAL:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Gunakan: /set_interval 30s|1m|5m|1h")
     elif txt == BTN_LIST:
@@ -315,8 +399,10 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             preview = "\n".join([f"{i+1}. {it['url']}" for i,it in enumerate(q[:10])])
             more = f"\n...dan {len(q)-10} lagi" if len(q) > 10 else ""
             await context.bot.send_message(chat_id=update.effective_chat.id, text=f"📦 Daftar antrian ({len(q)} item):\n{preview}{more}")
-    elif txt == BTN_REFRESH: await ensure_countdown_on(update, context)
-    else: await on_text(update, context)
+    elif txt == BTN_REFRESH:
+        await ensure_countdown_on(update, context)
+    else:
+        await on_text(update, context)
 
 async def cmd_start_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
@@ -324,7 +410,7 @@ async def cmd_start_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Antrian kosong. Tambahkan link dulu."); return
     ok = start_scheduler(context.application)
     if ok: await ensure_countdown_on(update, context)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Pengiriman dimulai." if ok else "ℹ️ Sudah berjalan.")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Pengiriman dimulai (dengan jitter 1–30 menit sebelum kirim pertama)." if ok else "ℹ️ Sudah berjalan.")
 
 async def cmd_stop_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
@@ -343,12 +429,17 @@ async def cmd_set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context): return
+    # /sendnow bypass jitter, kirim semua sekali jalan
     count = await process_all_once()
     if not load_queue():
         if STATE.running:
             STATE.grace_until = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
             STATE.next_send_at = STATE.grace_until
+            STATE.phase = None
+            STATE.jitter_until = None
     elif STATE.running:
+        # setelah manual kirim, lanjut delay utama dulu
+        STATE.phase = 'interval'
         STATE.next_send_at = datetime.now(timezone.utc) + timedelta(milliseconds=STATE.interval_ms)
     await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Terkirim {count} item.")
 
